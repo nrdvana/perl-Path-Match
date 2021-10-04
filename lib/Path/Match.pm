@@ -4,21 +4,9 @@ use warnings;
 require Carp;
 require Scalar::Util;
 our $DEBUG; #= sub { warn @_; };
-# The nodes are optimized as arrayrefs, rather than hashes or objects.
-# These constants are the "attribute names" of the arrayrefs.
-use constant {
-	NODE_LEAF_PATHS       => 0,
-	NODE_BACKTRACK        => 1,
-	NODE_PATTERNS_SET     => 2,
-	NODE_COMPILED         => 3,
-	NODE_FIRST_PATTERN    => 4,
-	NODE_PATTERN_REGEX    => 0,
-	NODE_PATTERN_ORDER    => 1,
-	NODE_PATTERN_SUBNODES => 2,
-	NODE_PATTERN_ACTIONS  => 3,
-};
 
-# ABSTRACT: Test a path against many glob-like patterns, efficiently
+# ABSTRACT: Match a path against many glob-like patterns, efficiently
+# VERSION
 
 =head1 SYNOPSIS
 
@@ -41,7 +29,7 @@ use constant {
   ]);
   sub dispatch($uri) {
     $router->search($uri => sub($match, @captures) {
-      return 0 unles ...       # decide whether you want this match, or try the next
+      return 0 unless ...      # decide whether you want this match, or try the next
       $match->{action}->(...)  # dispatch however you like
       return 1;                # end search
     });
@@ -49,21 +37,28 @@ use constant {
 
 =head1 DESCRIPTION
 
-This module is a simple algorithm for comparing a path efficiently to multiple glob-like
+This module is an optimized algorithm for comparing a path efficiently to multiple glob-like
 patterns (the rsync variety where C<*> matches within one directory and C<**> matches multiple
 directories deep).  The matching occurs in a tree-style recursive search so that it can
 efficiently handle arbitrary numbers of paths, making it suitable for use as a URL router in
 a web app.  It also has the ability to find I<all> matches, or just the best one, or iterate
 them in a priority-based order.
 
+This module only deals with paths, and only with fairly basic wildcards.  However it is easy to
+build more advanced matching for HTTP routers by iterating all the path-matches found by this
+module while performing further matching, such as regex-checks on the captured components,
+header checks, or HTTP method checks.  HTTP routing almost always uses basic path notations to
+divide up the request-space, so this module can serve as an efficient first step to narrow the
+list of potential controller actions.
+
 =head2 Patterns
 
 The patterns should be familiar to anyone who has used C<< rsync --exclude >>, but in short,
 C<'*'> captures any string that doesn't contain a path separator, and C<**> matches any
-string including path separators.  As a special case, if C<**> is bounded by path separators
-(or end of string) it may match negative-one characters (in other words, C<'/**/'> may match
-C<'/'> and C<'/**'> may match C<''>).  The single-star capture may occur more than once in a
-single path part, such as C</a*b*xyz/>.
+string including path separators.  The single-star capture may occur more than once in a single
+path component, such as C<'/a*b*xyz/'>.  As a special case, if C<**> is bounded by path
+separators (or end of string) it may match "zero path components", such as C<'a/**/b'> matching
+C<'a/b'>, C<'a/**'> matching C<'a'>, or C<'**/b'> matching C<'/b'>.
 
 =head1 Match Priority
 
@@ -103,8 +98,24 @@ Double-star captures
 
 =back
 
-and all ties are resolved by which rule came first.  Duplicate paths are allowed, and will be
+All ties are resolved by which rule came first.  Duplicate paths are allowed, and will be
 iterated in order given.
+
+=cut
+
+# The nodes are optimized as arrayrefs, rather than hashes or objects.
+# These constants are the "attribute names" of the arrayrefs.
+use constant {
+	NODE_LEAF_PATHS       => 0,
+	NODE_BACKTRACK        => 1,
+	NODE_PATTERNS_SET     => 2,
+	NODE_COMPILED         => 3,
+	NODE_FIRST_PATTERN    => 4,
+	NODE_PATTERN_REGEX    => 0,
+	NODE_PATTERN_ORDER    => 1,
+	NODE_PATTERN_SUBNODES => 2,
+	NODE_PATTERN_ACTIONS  => 3,
+};
 
 =head1 CONSTRUCTOR
 
@@ -114,8 +125,8 @@ iterated in order given.
                        ...->new( \%attributes );
                        ...->new( \@patterns );
 
-The constructor takes a hashref or key/value list of attributes.  Or, you may pass the
-L</patterns> attribute as the only parameter.
+The constructor takes a hashref or key/value list of attributes.  For convenience, you may pass
+an arrayref of the L</patterns> attribute as the only parameter.
 
 =cut
 
@@ -157,11 +168,13 @@ An object with a 'pattern' attribute.
 
 =back
 
-The elements of this list will be returned from searches, so you may structure them however you
-like to maximize convenience.
-
 The attribute may be assigned, but modifying the existing arrayref has no effect.
 Use L</add_pattern> to add additional patterns and re-build the search tree.
+
+Note that elements from this list are what L</search> delivers to the callback, so if you are
+building something elaborate like a HTTP router, you can use structured items like
+C<< { pattern => $p, method => 'GET', action => $coderef } >> to hold all the rest of the
+decision-making details needed by your callback.
 
 =cut
 
@@ -177,6 +190,10 @@ sub set_patterns {
 =head1 METHODS
 
 =head2 add_pattern
+
+  $path_match->add_pattern($pattern);
+
+Add one element to L</patterns>.
 
 =cut
 
