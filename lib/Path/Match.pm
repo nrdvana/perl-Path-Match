@@ -163,7 +163,7 @@ sub new {
 	my $class= shift;
 	my $self= @_ != 1? { @_ }
 		: @_ == 1 && ref $_[0] eq 'ARRAY'? { patterns => $_[0] }
-		: %{$_[0]};
+		: { %{$_[0]} };
 	bless $self, $class;
 	$self->{_tree}= [];
 	$self->_add_patterns_to_tree($self->{_tree}, $self->{patterns})
