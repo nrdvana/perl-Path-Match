@@ -10,6 +10,8 @@ our $DEBUG; #= sub { warn @_; };
 
 =head1 SYNOPSIS
 
+  # Example: iterating filesystem while ignoring patterns
+  
   my $ignore_patterns= Path::Match->new([
     'a/*/b',
     'a/*/c',
@@ -20,12 +22,14 @@ our $DEBUG; #= sub { warn @_; };
     next if $ignore_patterns->matches($_);
     ...
   }
+  
+  # Example: dispatching web requests
 
   my $router= Path::Match->new([
-    { pattern => '/album/*', action => ... },
-    { pattern => '/artist/*', action => ... },
-    { pattern => '/artist/*/album', action => ... },
-    { pattern => '**/favicon.ico', action => ... },
+    { pattern => '/album/*',        ... },
+    { pattern => '/artist/*',       ... },
+    { pattern => '/artist/*/album', ... },
+    { pattern => '**/favicon.ico',  ... },
   ]);
   sub dispatch($uri) {
     $router->search($uri => sub($match, @captures) {
@@ -60,9 +64,34 @@ path component, such as C<'/a*b*xyz/'>.  As a special case, if C<**> is bounded 
 separators (or end of string) it may match "zero path components", such as C<'a/**/b'> matching
 C<'a/b'>, C<'a/**'> matching C<'a'>, or C<'**/b'> matching C<'/b'>.
 
-=head1 Match Priority
+=head2 Pattern Instances
 
-Pattern matching gives priority to
+For maximum flexibility, you may provide the patterns to this module in a variety of forms.
+The thing you provide to the module will be the same thing you get back from the search method.
+
+=over 25
+
+=item C<$pattern>
+
+A simple scalar containing the pattern notation.
+
+=item C<< [ $pattern, ... ] >>
+
+An arrayref whose first element is the pattern notation.
+
+=item C<< { pattern => $pattern, ... } >>
+
+A hashref containing the key C<'pattern'>.
+
+=item C<< $pattern= $obj->pattern() >>
+
+An object with a 'pattern' attribute.
+
+=back
+
+=head2 Match Priority
+
+Pattern matching gives priority to:
 
 =over
 
@@ -146,29 +175,9 @@ sub new {
 
 =head2 patterns
 
-An arrayref of patterns, each being one of:
+An arrayref of patterns.  See L</Patterns> and L</Pattern Instances>.
 
-=over 25
-
-=item C<'pattern'>
-
-A simple scalar containing the pattern
-
-=item C<< [ $pattern, ... ] >>
-
-An arrayref whose first element is the pattern
-
-=item C<< { pattern => $p, ... } >>
-
-A hashref containing the key C<'pattern'>.
-
-=item C<< $obj->can('pattern') >>
-
-An object with a 'pattern' attribute.
-
-=back
-
-The attribute may be assigned, but modifying the existing arrayref has no effect.
+The attribute may be assigned a new arrayref, but modifying the existing arrayref has no effect.
 Use L</add_pattern> to add additional patterns and re-build the search tree.
 
 Note that elements from this list are what L</search> delivers to the callback, so if you are
@@ -178,7 +187,11 @@ decision-making details needed by your callback.
 
 =cut
 
-sub patterns { $_[0]->set_patterns($_[1]) if @_ > 1; $_[0]{patterns} }
+sub patterns {
+	$_[0]->set_patterns($_[1]) if @_ > 1;
+	$_[0]{patterns}
+}
+
 sub set_patterns {
 	my ($self, $p)= @_;
 	my $tree= [];
@@ -438,3 +451,88 @@ sub _search_tree {
 }
 
 1;
+
+=head1 SEE ALSO
+
+Was it worth publishing this module?  Despite the massive number of similar-goal
+modules on CPAN, this module actually fills a niche that wasn't already solved:
+using an B<optimized algorithm> (not brute force) to match one path against
+multiple patterns and B<return all the matches> while also B<ranking them> by
+which is the "best" match.  It also B<doesn't depend on a larger framework> to
+operate.  This is also one of the only modules that can act as a path router
+as well as a B<generic shell-glob comparator>.
+
+Here are the others you can find on CPAN:
+
+=over 20
+
+=item L<Text::Glob>
+
+Match a string against a regex compiled from a shell-glob pattern.  Only compares one pattern
+at a time.
+
+=item L<FastGlob>
+
+Match a shell-glob pattern against files in the real filesystem.
+
+=item L<URI::Router>
+
+Claims to be the fastest of all HTTP path routers.  Appears to use the best algorithm of any
+module.  Requires XS.  Can't be used for generic shell glob tests.
+
+=item L<Path::Map>
+
+Maps a URL to a matching handler.  Small, fast, few dependencies.  Supports named-captures.
+Doesn't support duplicate paths or content after wildcard.
+
+=item L<Router::PathInfo>
+
+Dispatch a URL to a set of rules.  Based on Plack; supports PATH_INFO and REQUEST_METHOD
+matching, and filesystem lookup of static files.  Optimized by cache and tree lookup.
+
+=item L<Path::AttrRouter>
+
+Match a path to routes defined in Controllers via method attributes.  Based on Mouse.
+Optimized by tree lookup.
+
+=item L<Path::Pygmy>
+
+Match a path to a route and vice versa.  Supports named captures, and reverse mapping.
+No dependencies.  Optimized by tree lookup.  Does not support multiple matches or match by
+http-method.
+
+=item L<Path::Router>
+
+Dispatch a URL by comparing to every rule in a list.  Supports named-captures and Moose types.
+Based on Moo.  Optimized by code generation (but still C<< O(n) >> ).
+
+=item L<HTTP::Router>
+
+Match a HTTP method and path to a set of rules.  Based on Hash::AsObject.  Minor optimization
+using path depth.
+
+=item L<Path::Dispatcher>
+
+Dispatch a URL by comparing to every rule in a list.  Large number of matching options.
+Based on Moo and Type::Tiny.  No optimization.
+
+=item L<Router::Simple>
+
+Match a PSGI request to a set of rules.  Based on Class::Accessor::Lite.  No optimization.
+
+=item L<Router::Dumb>
+
+Match a path to a set of rules.  Based on Moose.  Minor optimization using path depth.
+
+=item L<Router::R3>
+
+Match a path to a set of rules.  Extremely fast, via prefix-trie in XS.  Supports string and
+digit captures.
+
+=item L<Router::XS>
+
+Match a path to a set of rules.  Extremely fast, via prefix-trie in XS.  Faster than Router::R3
+but uses a global route list.
+
+=back
+
