@@ -25,7 +25,8 @@ my @tests= (
 	[ 'c' => [ $patterns[2], [] ] ],
 	[ 'd' => [ $patterns[3], [] ] ],
 );
-#local $Web::ConServe::PathMatch::DEBUG= sub { warn "$_[0]\n" };
+#diag explain ($matcher->_compile);
+#local $Path::Match::DEBUG= sub { warn "@_\n" };
 for (@tests) {
 	my ($path, @expected)= @$_;
 	my @actual;
