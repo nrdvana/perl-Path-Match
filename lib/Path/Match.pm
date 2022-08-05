@@ -4,7 +4,7 @@ use warnings;
 require Carp;
 require Scalar::Util;
 our $DEBUG= undef;#sub { use DDP; warn join(' ', map +(ref? &np($_) : $_), @_)."\n"; };
-use 5.020;
+use 5.026;
 use Time::HiRes 'time';
 use Moo;
 BEGIN {
@@ -243,11 +243,17 @@ The search method returns true if the callback returns true at any point, and fa
 
 =cut
 
+our $_callback;
+our @_captures;
+our $_reverse;
 sub search {
 	my ($self, $path, $callback)= @_;
+	local $_callback= $callback;
+	local @_captures= ();
+	local $_reverse= !1;
 	for ($path) {
 		pos= 0;
-		return $self->_search(($self->{_compiled_nodes} || $self->_compile)->[0], $callback, []);
+		return $self->_search(($self->{_compiled_nodes} || $self->_compile)->[0]);
 	}
 }
 
@@ -362,12 +368,13 @@ sub _compile_node {
 	return $cnode;
 }
 
+our $_next_node;
 sub _compile_trie_matcher {
 	my ($self, $node, $path, %options)= @_;
 	my $re= $self->_compile_trie_regex_text($node, $path, %options);
 	$re= "\\G $re" unless $options{unanchored};
-	my $matcher= eval "use strict; use warnings; sub { my \$next; /$re/gcx? \$next : undef }" or die "$@";
-	return bless set_subname("_Matcher /$re/x", $matcher), 'Path::Match::_Matcher';
+	my $matcher= eval "qr/$re/x" or die "$@";
+	#return bless set_subname("_Matcher /$re/x", $matcher), 'Path::Match::_Matcher';
 }
 
 sub _compile_trie_regex_text {
@@ -400,14 +407,14 @@ sub _compile_trie_regex_text {
 	my @alt= map quotemeta($_) . $self->_compile_trie_regex_text($node->{$_}, $path_so_far.$_, %options),
 		grep length == 1, @keys;
 	# If further processing needed here, add a stopping point
-	push @alt, '(?{ $next='.$cnode->{idx}.' })' if $cnode;
+	push @alt, '(?{ $_next_node='.$cnode->{idx}.' })' if $cnode;
 	# prevent backtracking
 	$re .= @alt > 1? ' (?> ' . join(' | ', @alt) . ' )' : ' '.$alt[0];
 	return $re;
 }
 
 sub _search {
-	my ($self, $node, $callback, $captures, $reverse)= @_;
+	my ($self, $node, $callback, $reverse)= @_;
 	while (1) {
 		$DEBUG->("node $node->{path}: used '".substr($_, 0, pos)."', remaining '".substr($_, pos)."'") if $DEBUG;
 		if (length > pos) {
@@ -415,8 +422,9 @@ sub _search {
 			if (defined $node->{matchers}) {
 				for my $m (@{$node->{matchers}}) {
 					$DEBUG->("node $node->{path} check matcher $m") if $DEBUG;
-					if (my $next_idx= &$m) {
-						my $ret= $self->_search($self->{_compiled_nodes}[$next_idx], $callback, $captures, $reverse);
+					if (/$m/gc) {
+						local @_captures= ( @_captures, @{^CAPTURE} ) if @{^CAPTURE};
+						my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
 						return $ret if $ret;
 						pos= $pos; # reset pos to backtrack and look for other wild matches
 					}
@@ -424,9 +432,10 @@ sub _search {
 			}
 			if (defined $node->{reverse}) {
 				for (scalar reverse substr($_, pos)) {
-					say "node $node->{path} check reverse matcher $node->{reverse} vs '$_'";
-					if (my $next_idx= &{$node->{reverse}}) {
-						my $ret= $self->_search($self->{_compiled_nodes}[$next_idx], $callback, $captures, !$reverse);
+					$DEBUG->("node $node->{path} check reverse matcher $node->{reverse} vs '$_'") if $DEBUG;
+					if (/$node->{reverse}/gc) {
+						local $_reverse= !$_reverse;
+						my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
 						return $ret if $ret;
 					}
 				}
@@ -434,8 +443,9 @@ sub _search {
 			if (defined $node->{unanchored}) {
 				for my $m (@{$node->{unanchored}}) {
 					$DEBUG->("node $node->{path} check unanchored matcher $m") if $DEBUG;
-					if (my $next_idx= &$m) {
-						my $ret= $self->_search($self->{_compiled_nodes}[$next_idx], $callback, $captures, $reverse);
+					if (/$m/gc) {
+						local @_captures= ( @_captures, @{^CAPTURE} ) if @{^CAPTURE};
+						my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
 						return $ret if $ret;
 						pos= $pos; # reset pos to backtrack and look for other wild matches
 					}
@@ -443,10 +453,9 @@ sub _search {
 			}
 		}
 		elsif (defined $node->{terminals}) {
-			my $captures= [];
 			for (@{$node->{terminals}}) {
 				$DEBUG->("Matched pattern $_: $self->{patterns}[$_]") if $DEBUG;
-				my $ret= $callback->($self->{patterns}[$_], $captures);
+				my $ret= $_callback->($self->{patterns}[$_], \@_captures);
 				return $ret if $ret;
 			}
 		}
