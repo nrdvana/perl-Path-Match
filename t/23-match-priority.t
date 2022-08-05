@@ -6,27 +6,6 @@ use Test::More;
 use_ok 'Path::Match'
 	or BAIL_OUT;
 
-subtest literal_path => sub {
-	my @patterns= (
-		{ pattern => '/foo' },
-		{ pattern => '/bar' },
-		{ pattern => '/baz' },
-	);
-	my $matcher= Path::Match->new(patterns => \@patterns);
-	my @tests= (
-		[ '/foo' => [ $patterns[0], [] ] ],
-		[ '/bar' => [ $patterns[1], [] ] ],
-		[ '/baz' => [ $patterns[2], [] ] ],
-	);
-	#local $Web::ConServe::PathMatch::DEBUG= sub { warn "$_[0]\n" };
-	for (@tests) {
-		my ($path, @expected)= @$_;
-		my @actual;
-		ok( $matcher->search($path, sub { push @actual, [@_]; 1 }) );
-		is_deeply( \@actual, \@expected, "path $path" );
-	}
-};
-
 subtest path_with_capture => sub {
 	my @patterns= (
 		'/foo/*',
@@ -49,7 +28,8 @@ subtest path_with_capture => sub {
 		my ($path, @expected)= @$_;
 		my @actual;
 		$matcher->search($path, sub { push @actual, [@_]; 0 });
-		is_deeply( \@actual, \@expected, "path $path" );
+		is_deeply( \@actual, \@expected, "path $path" )
+			or diag explain \@actual;
 	}
 };
 
@@ -64,7 +44,7 @@ subtest wildcard_nuances => sub {
 		'/bar/**/d/*',
 		'/bar/**/t*',
 	);
-	#local $Web::ConServe::PathMatch::DEBUG= sub { warn "$_[0]\n" };
+	#local $Path::Match::DEBUG= sub { warn @_, "\n" };
 	my $matcher= Path::Match->new(patterns => \@patterns);
 	my @tests= (
 		[ '/'            => () ],
@@ -102,6 +82,7 @@ subtest wildcard_nuances => sub {
 			[ $patterns[4], ['1/x/2/1/2/3/y'] ],
 		],
 		[ '/bar/t' =>
+			[ $patterns[7], [ '', '' ] ],
 			[ $patterns[4], [ 't' ] ],
 		],
 		[ '/bar/42/d/'   => [ $patterns[4], ['42/d/'] ] ],

@@ -245,11 +245,13 @@ The search method returns true if the callback returns true at any point, and fa
 
 our $_callback;
 our @_captures;
+our @_reverse_cap;
 our $_reverse;
 sub search {
 	my ($self, $path, $callback)= @_;
 	local $_callback= $callback;
 	local @_captures= ();
+	local @_reverse_cap;
 	local $_reverse= !1;
 	for ($path) {
 		pos= 0;
@@ -296,17 +298,18 @@ sub _add_pattern_to_trie {
 		# Descend into trie for each character of constant portion
 		# Slashes adjacent to stars are handled specially.
 		$node= ($node->{$1}//={})
-			while m,\G( [^*/] | / (?! \*\* ) ),gcx;
+			while m,\G( [^*/] | / (?! \* \* ) ),gcx;
 		# Path wildcard is lower priority than others, so separate from '*' wilds.
 		# Capture slashes on either side of the '**'.
 		if (m,\G( /? \*\* /? ),gcx) {
 			my $globstar= $1;
 			# When starts with wildcard but ends with literal, change strategy
-			# to match from end of string backward.
-			if (substr($_, -2) !~ /( \* | \*\/ )\Z/x) {
+			# to match from end of string backward.  Also allow a single-star
+			# component, because that's less guesswork than a globstar.
+			if (substr($_, -3) !~ / \*\* \/? \Z/x) {
 				my $remain= reverse $globstar.substr($_, pos);
 				pos $remain = 0;
-				return $self->_add_pattern_to_trie($node->{wild_reverse}//={}, $pat_idx) for $remain;
+				return $self->_add_pattern_to_trie($node->{reverse}//={}, $pat_idx) for $remain;
 			}
 			else {
 				my $sub_trie= {};
@@ -334,7 +337,7 @@ sub _compile {
 sub _compile_node {
 	my ($self, $node, $path, %options)= @_;
 	my @trie_paths= grep length == 1, keys %$node;
-	my ($terminals, $wild, $wild_reverse, $wild_path)= @{$node}{qw( terminals wild wild_reverse wild_path )};
+	my ($terminals, $wild, $reverse, $wild_path)= @{$node}{qw( terminals wild reverse wild_path )};
 	# Initialize the new compiled node and add it to the list.
 	# This list index is used to refer to nodes from the regex and from other nodes.
 	my $idx= @{ $self->{_compiled_nodes} };
@@ -342,11 +345,12 @@ sub _compile_node {
 		idx => $idx,     # the index of this compiled node in the list
 		path => $path,   # the pattern matched so far, for debugging aid
 		($options{backtrack}? (backtrack => $options{backtrack}) : ()),
+		$options{is_reverse}? (is_reverse => 1) : (),
 	};
 	$cnode->{is_leaf}= 1
-		if $terminals && !@trie_paths && !$wild && !$wild_reverse && !$wild_path;
+		if $terminals && !@trie_paths && !$wild && !$reverse && !$wild_path;
 	$cnode->{is_backtrack_dest}= 1
-		if $wild || $wild_reverse || $wild_path;
+		if length($path) && ($wild || $reverse || $wild_path);
 	$cnode->{terminals}= [ @$terminals ]
 		if $terminals;
 	push @{ $self->{_compiled_nodes} }, $cnode;
@@ -358,14 +362,22 @@ sub _compile_node {
 		# Make a regex out of each of the wild portions, longest pattern first
 		for (sort { length $b <=> length $a } keys %$wild) {
 			# Replace '*' with regex notation for not matching the path separator
-			my $re_text= join '( [^\/]* )', map quotemeta, split /\*/, $_, -1;
+			# But, a lone '*' must match at least one character
+			my $re_text= $_ eq '*'? '( [^\/]+ )'
+				: join '( [^\/]* )', map quotemeta, split /\*/, $_, -1;
 			# Follow this regex with the rest of a trie-construction from this node
 			push @{$cnode->{matchers}},
 				$self->_compile_trie_matcher($wild->{$_}, $path . $_, prefix => $re_text, origin => $cnode->{idx});
 		}
 	}
-	if ($wild_reverse) {
-		$cnode->{reverse}= $self->_compile_trie_matcher($wild_reverse, $path, reverse => 1, origin => $cnode->{idx});
+	if ($reverse) {
+		$cnode->{reverse}= $self->_compile_node($reverse, '',
+			%options,
+			matchers => 1,
+			backtrack => undef,
+			is_reverse => !$cnode->{is_reverse},
+			origin => $cnode->{idx}
+		);
 	}
 	if ($wild_path) {
 		for (@$wild_path) {
@@ -433,7 +445,7 @@ sub _search {
 		if (length == pos) {
 			for (@{$node->{terminals}}) {
 				$DEBUG->("Matched pattern $_: $self->{patterns}[$_]") if $DEBUG;
-				my $ret= $_callback->($self->{patterns}[$_], \@_captures);
+				my $ret= $_callback->($self->{patterns}[$_], [@_captures, @_reverse_cap]);
 				return $ret if $ret;
 			}
 		}
@@ -442,7 +454,10 @@ sub _search {
 			for my $m (@{$node->{matchers}}) {
 				$DEBUG->("node $node->{path} check matcher $m") if $DEBUG;
 				if (/$m/gc) {
-					local @_captures= ( @_captures, @{^CAPTURE} ) if @{^CAPTURE};
+					local @_captures= ( @_captures, @{^CAPTURE} )
+						if !$_reverse && @{^CAPTURE};
+					local @_reverse_cap= ( (map scalar reverse($_), reverse @{^CAPTURE} ), @_reverse_cap )
+						if $_reverse && @{^CAPTURE};
 					my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
 					return $ret if $ret;
 					pos= $pos; # reset pos to backtrack and look for other wild matches
@@ -450,20 +465,21 @@ sub _search {
 			}
 		}
 		if (defined $node->{reverse}) {
-			for (scalar reverse substr($_, pos)) {
-				$DEBUG->("node $node->{path} check reverse matcher $node->{reverse} vs '$_'") if $DEBUG;
-				if (/$node->{reverse}/gc) {
-					local $_reverse= !$_reverse;
-					my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
-					return $ret if $ret;
-				}
-			}
+			$DEBUG->("node $node->{path}: trying reverse match") if $DEBUG;
+			local $_reverse= !$_reverse;
+			my $rev_subject= reverse substr($_, pos);
+			pos($rev_subject)= 0;
+			my $ret= $self->_search($node->{reverse}) for $rev_subject;
+			return $ret if $ret;
 		}
 		if (defined $node->{unanchored}) {
 			for my $m (@{$node->{unanchored}}) {
 				$DEBUG->("node $node->{path} check unanchored matcher $m") if $DEBUG;
 				if (/$m/gc) {
-					local @_captures= ( @_captures, @{^CAPTURE} ) if @{^CAPTURE};
+					local @_captures= ( @_captures, @{^CAPTURE} )
+						if !$_reverse && @{^CAPTURE};
+					local @_reverse_cap= ( (map scalar reverse($_), reverse @{^CAPTURE} ), @_reverse_cap )
+						if $_reverse && @{^CAPTURE};
 					my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
 					return $ret if $ret;
 					pos= $pos; # reset pos to backtrack and look for other wild matches
