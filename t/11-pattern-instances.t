@@ -18,6 +18,7 @@ my @patterns= (
 	PatternObject->new({ pattern => 'd' })
 );
 my $matcher= Path::Match->new(\@patterns);
+$matcher->_compile;
 my @tests= (
 	[ 'a' => [ $patterns[0], [] ] ],
 	[ 'b' => [ $patterns[1], [] ] ],
@@ -29,7 +30,8 @@ for (@tests) {
 	my ($path, @expected)= @$_;
 	my @actual;
 	ok( $matcher->search($path, sub { push @actual, [@_]; 1 }) );
-	is_deeply( \@actual, \@expected, "path $path" );
+	is_deeply( \@actual, \@expected, "path $path" )
+		or diag explain \@actual;
 }
 
 done_testing;
