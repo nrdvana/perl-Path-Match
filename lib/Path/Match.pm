@@ -7,15 +7,15 @@ our $DEBUG= undef;#sub { use DDP; warn join(' ', map +(ref? &np($_) : $_), @_)."
 use 5.026;
 use Time::HiRes 'time';
 use Moo;
-#BEGIN {
-#	unless (eval { require Sub::Util; Sub::Util->import('set_subname','subname'); 1 }) {
-#		*set_subname= sub { $_[1] };
-#		*subname= sub { "(Install Sub::Util for better diagnostics)" };
-#	}
-#	{ package Path::Match::_Matcher;
-#		use overload '""' => sub { Path::Match::subname(shift) };
-#	}
-#}
+BEGIN {
+	unless (eval { require Sub::Util; Sub::Util->import('set_subname','subname'); 1 }) {
+		*set_subname= sub { $_[1] };
+		*subname= sub { "(Install Sub::Util for better diagnostics)" };
+	}
+	{ package Path::Match::_Matcher;
+		use overload '""' => sub { Path::Match::subname(shift) };
+	}
+}
 
 # ABSTRACT: Match a path against many glob-like patterns, efficiently
 # VERSION
@@ -148,7 +148,7 @@ iterated in order given.
 
   $path_match= Path::Match->new( %attributes );
                        ...->new( \%attributes );
-                       ...->new( \@patterns );
+                       ...->new( \@patterns, %attributes );
 
 The constructor takes a hashref or key/value list of attributes.  For convenience, you may pass
 an arrayref of the L</patterns> attribute as the only parameter.
@@ -157,11 +157,16 @@ an arrayref of the L</patterns> attribute as the only parameter.
 
 sub new {
 	my $class= shift;
-	my $self= @_ != 1? { @_ }
-		: @_ == 1 && ref $_[0] eq 'ARRAY'? { patterns => $_[0] }
-		: { %{$_[0]} };
+	my $self= @_ >= 1 && ref $_[0] eq 'ARRAY'? { patterns => @_ }
+		: ref $_[0] eq 'HASH'? { %{$_[0]} }
+		: { @_ };
+	$self->{syntax}{separator}= delete $self->{sep} if exists $self->{sep};
+	$self->{syntax}{expansion}= delete $self->{exp} if exists $self->{exp};
+	$self->{syntax}{escape}= delete $self->{esc} if exists $self->{esc};
+	$self->{syntax}{anychar}= delete $self->{any} if exists $self->{any};
 	bless $self, $class;
-	$self->_add_patterns_to_trie if $self->{patterns};
+	$self->set_syntax($self->{syntax} ||= {});
+	$self->set_patterns($self->{patterns} ||= []);
 	$self;
 }
 
@@ -189,9 +194,172 @@ sub patterns {
 sub set_patterns {
 	my ($self, $p)= @_;
 	$self->{patterns}= $p;
-	$self->{_trie}= {};
-	$self->_add_patterns_to_trie;
+#	$self->{_trie}= {};
+#	$self->_add_patterns_to_trie;
 	$self;
+}
+
+=head2 syntax
+
+A collection of options describing the grammar of the shell-glob patterns.
+
+Using the defaults as an example:
+
+  { separator   => '/',
+    expansion   => [ '{', ',', '}' ],
+    charset     => [ '[', ']' ],
+    anychar     => '?',
+    escape      => '\\',
+    part_wild   => '*',
+    path_wild   => '**',
+  }
+
+Each component above may be a string or a regex-ref.  If the field is not given, it receives
+the default above.  If the field is set to C<undef>, that part of the syntax is disabled.
+(You can't disable the path_separator, as that's fundamental to the algorithm)
+
+=head2 set_syntax
+
+Same as C<< $obj->syntax($new_syntax); >>
+
+Be sure to set the value of the whole syntax attribute rather than making changes to the
+internals of the current attribute, or else it won't trigger a re-compile.
+
+=cut
+
+our %syntax_defaults= (
+	separator   => '/',
+	escape      => '\\',
+	expansion   => [ '{', ',', '}' ],
+	charset     => [ '[', ']' ],
+	anychar     => '?',
+	part_wild   => '*',
+	path_wild   => '**',
+);
+
+sub syntax {
+	$_[0]->set_syntax($_[1]) if @_ > 1;
+	$_[0]{syntax};
+}
+sub set_syntax {
+	my ($self, $syn)= @_;
+	my @unknown= grep !exists $syntax_defaults{$_}, keys %$syn;
+	Carp::carp("Unknown syntax components ".join(', ', @unknown))
+		if @unknown;
+	for (keys %syntax_defaults) {
+		next if exists $syn->{$_};
+		$syn->{$_}= ref $syntax_defaults{$_} eq 'ARRAY'? [ @{ $syntax_defaults{$_} } ] : $syntax_defaults{$_};
+	}
+	Carp::croak("separator must be defined")
+		unless length $syn->{separator};
+	$self->{syntax}= $syn;
+	delete $self->{_compiled_matchers};
+	delete $self->{_glob_parser};
+	$self;
+}
+
+sub _perform_expansion {
+	return shift; # TODO
+}
+sub _translate_pwild {
+	my $spec= shift;
+	# Leading slash is meaningless because the "current directory" is essentially "/"
+	shift @$spec if ref $spec->[0] && $spec->[0][0] eq '/';
+	# Trailing slash is meaningless because there is no test for whether a path part is a directory
+	pop @$spec if ref $spec->[-1] && $spec->[-1][0] eq '/';
+	for (my $i=0; $i < @$spec; $i++) {
+		if (ref $spec->[$i] && $spec->[$i][0] eq '**') {
+			# If '**' follows a /, convert it to '/**'
+			if ($i > 0 && ref $spec->[$i-1] && $spec->[$i-1][0] eq '/') {
+				splice(@$spec, $i, 1);
+				$spec->[--$i][0]= '/**';
+			}
+			# If '**' is followed by '/', convert it to '**/'
+			if ($i < $#$spec && ref $spec->[$i+1] && $spec->[$i+1][0] eq '/') {
+				splice(@$spec, $i+1, 1);
+				$spec->[$i][0] .= '/';
+			}
+		}
+	}
+	$spec;
+}
+sub _glob_parser { $_[0]{_glob_parser} ||= $_[0]->_build__glob_parser }
+sub _build__glob_parser {
+	my $syn= shift->syntax;
+	my ($sep, $esc, $any, $wild, $pwild)=
+		map { !defined $_? '' : ref eq 'Regexp'? $_ : quotemeta }
+		@{$syn}{qw( separator escape anychar part_wild path_wild )};
+	my @exp= map { ref eq 'Regexp'? $_ : quotemeta } @{ $syn->{expansion} || [] };
+	my @charset= map { ref eq 'Regexp'? $_ : quotemeta } @{ $syn->{charset} || [] };
+	
+	my $re= '';
+	$re .= <<CODE if length $esc;
+		| $esc (.) (?{ \@parts && !ref \$parts[-1]? (\$parts[-1] .= \$1) : (push \@parts, \$1) })
+		| $esc \\z (?{ die "Encountered escape at end of string"; })
+CODE
+	$re .= <<CODE;
+		| $sep (?{ push \@parts, ["\\/"] })
+CODE
+	$re .= <<CODE if @charset;
+		# look for end-charset regex, but only after initial ^] possibility
+		# bash charsets allow '!' to mean negation as well as '^'
+		| $charset[0] ( [^!]? (?: $charset[1] )? .*? ) $charset[1] (?{ push \@parts, [ charset => \$1 ] })
+		# If start matched but remainder didn't, forcibly die
+		| $charset[0] (?{ die 'Expected $charset[1] somewhere after "'.substr(\$_, pos).'"'; })
+CODE
+	$re .= <<CODE if length $any;
+		| $any (?{ push \@parts, [ charset => \\"*" ] })
+CODE
+	$re .= <<CODE if length $pwild;
+		| $pwild (?{ push \@parts, ['**'] })
+CODE
+	$re .= <<CODE if length $wild;
+		| $wild (?{ push \@parts, ['*'] })
+CODE
+	$re .= <<CODE if @exp;
+		| $exp[0] (?{ \$do_exp= 1; push \@parts, [ exp => '{' ] })
+		| $exp[1] (?{ \$do_exp= 1; push \@parts, [ exp => ',' ] })
+		| $exp[2] (?{ \$do_exp= 1; push \@parts, [ exp => '}' ] })
+CODE
+	$re .= <<CODE;
+		| (.) (?{ \@parts && !ref \$parts[-1]? (\$parts[-1] .= \$1) : (push \@parts, \$1) })
+CODE
+	$re =~ s/\|/ /; # remove the first '|'
+	return ( eval <<CODE or die "$@" );
+	sub {
+		local \$_= shift if \@_;
+		my \@parts;
+		my \$do_exp;
+		pos= 0;
+		()= /\\G (?| $re )/gcx; # list context, to run all iterations
+		length == pos or die "Parse error at '".substr(\$_,pos)."'";
+		return map _translate_pwild(\$_), \$do_exp? _perform_expansion(\\\@parts) : \\\@parts;
+	}
+CODE
+}
+
+sub _parsed_glob_to_regex {
+	my ($self, $spec)= @_;
+	my ($sep, $esc, $any, $wild, $pwild)=
+		map { !defined $_? '' : ref eq 'Regexp'? $_ : quotemeta }
+		@{$self->syntax}{qw( separator escape anychar part_wild path_wild )};
+	my $single_char_sep= $sep =~ /^(\\.|.)\z/;
+	my $re= @$spec && ref $spec->[0] && $spec->[0][0] eq '**/'? '' :  "(?:$sep)?";
+	for (@$spec) {
+		if (!ref) { $re .= quotemeta($_) }
+		elsif ($_->[0] eq 'charset') { $re .= '[' . $_->[1] . ']' } # TODO handle '!' and escapes
+		elsif ($_->[0] eq 'any') { $re .= '.' }
+		elsif ($_->[0] eq '*') { $re .= $single_char_sep? "([^$sep]+)" : "( (?: (?! $sep ) . )* )" }
+		elsif ($_->[0] eq '/') { $re .= $sep }
+		elsif ($_->[0] eq '**') { $re .= "(.*?)" }
+		elsif ($_->[0] eq '/**') { $re .= "(?| $sep (.*?) | () \\z )" }
+		elsif ($_->[0] eq '**/') { $re .= "(?| (.*?) $sep | \\A () )" }
+		elsif ($_->[0] eq '/**/') { $re .= "(?| $sep () | $sep (.+?) $sep )" }
+		else { die "Unhandled token ".join(',', @$_) }
+	}
+	$re .= "(?:$sep)?" unless @$spec && ref $spec->[-1] && $spec->[-1][0] eq '/**';
+	#use DDP; &p([$spec, $re]);
+	qr/$re/x;
 }
 
 =head1 METHODS
@@ -243,21 +411,21 @@ The search method returns true if the callback returns true at any point, and fa
 
 =cut
 
-our $_callback;
-our @_captures;
-our @_reverse_cap;
-our $_reverse;
-sub search {
-	my ($self, $path, $callback)= @_;
-	local $_callback= $callback;
-	local @_captures= ();
-	local @_reverse_cap;
-	local $_reverse= !1;
-	for ($path) {
-		pos= 0;
-		return $self->_search(($self->{_compiled_nodes} || $self->_compile)->[0]);
-	}
-}
+#our $_callback;
+#our @_captures;
+#our @_reverse_cap;
+#our $_reverse;
+#sub search {
+#	my ($self, $path, $callback)= @_;
+#	local $_callback= $callback;
+#	local @_captures= ();
+#	local @_reverse_cap;
+#	local $_reverse= !1;
+#	for ($path) {
+#		pos= 0;
+#		return $self->_search(($self->{_compiled_nodes} || $self->_compile)->[0]);
+#	}
+#}
 
 # Nodes test the remainder of the path vs. a list of regexes
 # [
@@ -278,224 +446,305 @@ sub _pattern_from_object {
 	Carp::croak("Don't know how to get a pattern from '$thing'");
 }
 
-sub _add_patterns_to_trie {
-	my ($self, $from_idx)= @_;
-	$from_idx ||= 0;
-	my $patterns= $self->patterns;
-	my $trie= $self->{_trie} ||= {};
-	delete $self->{_compiled_nodes};
-	for my $idx ($from_idx .. $#$patterns) {
-		my $pattern_text= $self->_pattern_from_object($patterns->[$idx]);
-		pos $pattern_text = 0;
-		$self->_add_pattern_to_trie($trie, $idx) for $pattern_text;
-	}
+#sub _add_patterns_to_trie {
+#	my ($self, $from_idx)= @_;
+#	$from_idx ||= 0;
+#	my $patterns= $self->patterns;
+#	my $trie= $self->{_trie} ||= {};
+#	delete $self->{_compiled_nodes};
+#	for my $idx ($from_idx .. $#$patterns) {
+#		my $pattern_text= $self->_pattern_from_object($patterns->[$idx]);
+#		pos $pattern_text = 0;
+#		$self->_add_pattern_to_trie($trie, $idx) for $pattern_text;
+#	}
+#}
+#
+#sub _add_pattern_to_trie {
+#	my ($self, $node, $pat_idx)= @_;
+#	$node ||= $self->{_trie} ||= {};
+#	while (length > pos) {
+#		# Descend into trie for each character of constant portion
+#		# Slashes adjacent to stars are handled specially.
+#		$node= ($node->{$1}//={})
+#			while m,\G( [^*/] | / (?! \* \* ) ),gcx;
+#		# Path wildcard is lower priority than others, so separate from '*' wilds.
+#		# Capture slashes on either side of the '**'.
+#		if (m,\G( /? \*\* /? ),gcx) {
+#			my $globstar= $1;
+#			# When starts with wildcard but ends with literal, change strategy
+#			# to match from end of string backward.  Also allow a single-star
+#			# component, because that's less guesswork than a globstar.
+#			if (substr($_, -3) !~ / \*\* \/? \Z/x) {
+#				my $remain= reverse $globstar.substr($_, pos);
+#				pos $remain = 0;
+#				return $self->_add_pattern_to_trie($node->{reverse}//={}, $pat_idx) for $remain;
+#			}
+#			else {
+#				my $sub_trie= {};
+#				push @{ $node->{wild_path} }, [ $globstar, $sub_trie ];
+#				$node= $sub_trie;
+#			}
+#		}
+#		# Regular wildcards only continue until the next '/', or '**'
+#		elsif(m,\G( \* (?: [^*/] | [*] (?! [*] ) )* ),gcx) {
+#			$node= ($node->{wild}{$1}//={});
+#		}
+#		else { pos == length or die "bug" }
+#	}
+#	# At end of string, mark this as a terminal node
+#	push @{ $node->{terminals} }, $pat_idx;
+#}
+#
+#sub _compile {
+#	my ($self)= @_;
+#	$self->{_compiled_nodes}= [];
+#	$self->_compile_node($self->{_trie}, '', matchers => 1);
+#	return $self->{_compiled_nodes};
+#}
+#
+#sub _compile_node {
+#	my ($self, $node, $path, %options)= @_;
+#	my @trie_paths= grep length == 1, keys %$node;
+#	my ($terminals, $wild, $reverse, $wild_path)= @{$node}{qw( terminals wild reverse wild_path )};
+#	# Initialize the new compiled node and add it to the list.
+#	# This list index is used to refer to nodes from the regex and from other nodes.
+#	my $idx= @{ $self->{_compiled_nodes} };
+#	my $cnode= {
+#		idx => $idx,     # the index of this compiled node in the list
+#		path => $path,   # the pattern matched so far, for debugging aid
+#		($options{backtrack}? (backtrack => $options{backtrack}) : ()),
+#		$options{is_reverse}? (is_reverse => 1) : (),
+#	};
+#	$cnode->{is_leaf}= 1
+#		if $terminals && !@trie_paths && !$wild && !$reverse && !$wild_path;
+#	$cnode->{is_backtrack_dest}= 1
+#		if length($path) && ($wild || $reverse || $wild_path);
+#	$cnode->{terminals}= [ @$terminals ]
+#		if $terminals;
+#	push @{ $self->{_compiled_nodes} }, $cnode;
+#
+#	push @{$cnode->{matchers}}, $self->_compile_trie_matcher($node, $path, cnode => $cnode)
+#		if $options{matchers} && @trie_paths;
+#
+#	if ($wild) {
+#		# Make a regex out of each of the wild portions, longest pattern first
+#		for (sort { length $b <=> length $a } keys %$wild) {
+#			# Replace '*' with regex notation for not matching the path separator
+#			# But, a lone '*' must match at least one character
+#			my $re_text= $_ eq '*'? '( [^\/]+ )'
+#				: join '( [^\/]* )', map quotemeta, split /\*/, $_, -1;
+#			# Follow this regex with the rest of a trie-construction from this node
+#			push @{$cnode->{matchers}},
+#				$self->_compile_trie_matcher($wild->{$_}, $path . $_, prefix => $re_text, origin => $cnode->{idx});
+#		}
+#	}
+#	if ($reverse) {
+#		$cnode->{reverse}= $self->_compile_node($reverse, '',
+#			%options,
+#			matchers => 1,
+#			backtrack => undef,
+#			is_reverse => !$cnode->{is_reverse},
+#			origin => $cnode->{idx}
+#		);
+#	}
+#	if ($wild_path) {
+#		for (@$wild_path) {
+#			my ($globstar, $nextnode)= @$_;
+#			# globstar **/ at the start of the pattern may match an empty string
+#			# globstar /** at the end of the pattern may match an empty string
+#			# globstar /**/ may match a single slash, two slashes, or two slashes with arbitrary chars between
+#			# In all cases, the capture should not include the leading or trailing slash
+#			my $prefix= ($globstar eq '**/')? '(?| ^() | (.*?) \/ )'
+#				: ($globstar eq '/**')? '(?| \/ (.*?) | ()\Z )'
+#				: ($globstar eq '/**/')? '(?| ^() | \/()\/? | \/(.+?)\/ | ()\Z )'
+#				: '(.*?)';
+#			push @{$cnode->{unanchored}}, $self->_compile_trie_matcher($nextnode, $path.$globstar, prefix => $prefix, origin => $cnode->{idx});
+#		}
+#	}
+#	return $cnode;
+#}
+#
+#our $_next_node;
+#sub _compile_trie_matcher {
+#	my ($self, $node, $path, %options)= @_;
+#	my $re= $self->_compile_trie_regex_text($node, $path, %options);
+#	$re= "\\G $re" unless $options{unanchored};
+#	my $matcher= eval "qr/$re/x" or die "$@";
+#	#return bless set_subname("_Matcher /$re/x", $matcher), 'Path::Match::_Matcher';
+#}
+#
+#sub _compile_trie_regex_text {
+#	my ($self, $node, $path_so_far, %options)= @_;
+#	# On trie nodes that refer to a single character, descend to the next node
+#	# and add the character to the start of the regex.
+#	my $re= delete $options{prefix};
+#	my $cnode= delete $options{cnode};
+#	my @keys= keys %$node;
+#	while (@keys == 1 && 1 == length $keys[0]) {
+#		$re .= quotemeta $keys[0];
+#		$path_so_far .= $keys[0];
+#		$node= $node->{$keys[0]};
+#		$cnode= undef;
+#		@keys= keys %$node;
+#	}
+#	# Create a compild node for any trie node that ends a pattern, or has
+#	# wildcards branching from it.
+#	if (grep length > 1, @keys) {
+#		$cnode ||= $self->_compile_node($node, $path_so_far, %options);
+#		# Deeper nodes will need to backtrack to this one if it has any wildcards branching off of it
+#		$options{backtrack}= $cnode->{idx}
+#			if $cnode->{is_backtrack_dest};
+#	}
+#	$re .= " \\Z" if $cnode && $cnode->{is_leaf};
+#	# Convert each trie sub-node into a regex fragment
+#	my @alt= map $self->_compile_trie_regex_text($node->{$_}, $path_so_far.$_, %options, prefix => quotemeta($_)),
+#		grep length == 1, @keys;
+#	# If further processing needed here, add a stopping point
+#	push @alt, '(?{ $_next_node='.$cnode->{idx}.' })' if $cnode && length $re;
+#	# prevent backtracking
+#	$re .= @alt > 1? ' (?> ' . join(' | ', @alt) . ' )' : ' '.$alt[0];
+#	return $re;
+#}
+#
+#sub _search {
+#	my ($self, $node, $callback, $reverse)= @_;
+#	while (1) {
+#		$DEBUG->("node $node->{path}: used '".substr($_, 0, pos)."', remaining '".substr($_, pos)."'") if $DEBUG;
+#		if (length == pos) {
+#			for (@{$node->{terminals}}) {
+#				$DEBUG->("Matched pattern $_: $self->{patterns}[$_]") if $DEBUG;
+#				my $ret= $_callback->($self->{patterns}[$_], [@_captures, @_reverse_cap]);
+#				return $ret if $ret;
+#			}
+#		}
+#		my $pos= pos;
+#		if (defined $node->{matchers}) {
+#			for my $m (@{$node->{matchers}}) {
+#				$DEBUG->("node $node->{path} check matcher $m") if $DEBUG;
+#				if (/$m/gc) {
+#					local @_captures= ( @_captures, @{^CAPTURE} )
+#						if !$_reverse && @{^CAPTURE};
+#					local @_reverse_cap= ( (map scalar reverse($_), reverse @{^CAPTURE} ), @_reverse_cap )
+#						if $_reverse && @{^CAPTURE};
+#					my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
+#					return $ret if $ret;
+#					pos= $pos; # reset pos to backtrack and look for other wild matches
+#				}
+#			}
+#		}
+#		if (defined $node->{reverse}) {
+#			$DEBUG->("node $node->{path}: trying reverse match") if $DEBUG;
+#			local $_reverse= !$_reverse;
+#			my $rev_subject= reverse substr($_, pos);
+#			pos($rev_subject)= 0;
+#			my $ret= $self->_search($node->{reverse}) for $rev_subject;
+#			return $ret if $ret;
+#		}
+#		if (defined $node->{unanchored}) {
+#			for my $m (@{$node->{unanchored}}) {
+#				$DEBUG->("node $node->{path} check unanchored matcher $m") if $DEBUG;
+#				if (/$m/gc) {
+#					local @_captures= ( @_captures, @{^CAPTURE} )
+#						if !$_reverse && @{^CAPTURE};
+#					local @_reverse_cap= ( (map scalar reverse($_), reverse @{^CAPTURE} ), @_reverse_cap )
+#						if $_reverse && @{^CAPTURE};
+#					my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
+#					return $ret if $ret;
+#					pos= $pos; # reset pos to backtrack and look for other wild matches
+#				}
+#			}
+#		}
+#		last unless $node->{backtrack};
+#		$DEBUG->("Backtrack to $node->{backtrack}") if $DEBUG;
+#		my $btnode= $self->{_compiled_nodes}[$node->{backtrack}];
+#		# Backtracking only happens between non-wildcard alternatives, so can
+#		# just compare the length of the nodes' patterns to know how far back
+#		# on the input to seek.
+#		pos($_) -= length($node->{path}) - length($btnode->{path});
+#		$node= $btnode;
+#	}
+#	return !1;
+#}
+
+sub match_best_first { 1 }
+
+sub _sort_rules {
+	my ($self, $rules)= @_;
+	my %orig_order= map +( 0+$rules->[$_] => $_ ), 0..$#$rules;
+	my $rank= sub {
+		my $n_literal= grep !ref, @{$_[0][1]};
+		my $n_wild= grep +( ref && (index($_->[0],'*') >= 0) ), @{$_[0][1]};
+		my $n_pwild= grep +( ref && (index($_->[0],'**') >= 0) ), @{$_[0][1]};
+		return !$n_wild? 1 / ($n_literal+1)
+			: !$n_pwild? 2 / ($n_literal+1)
+			: 3 / ($n_literal+1);
+	};
+	@$rules= sort { $rank->($a) <=> $rank->($b) or $orig_order{0+$a} <=> $orig_order{0+$b} } @$rules;
+	$rules;
 }
 
-sub _add_pattern_to_trie {
-	my ($self, $node, $pat_idx)= @_;
-	$node ||= $self->{_trie} ||= {};
-	while (length > pos) {
-		# Descend into trie for each character of constant portion
-		# Slashes adjacent to stars are handled specially.
-		$node= ($node->{$1}//={})
-			while m,\G( [^*/] | / (?! \* \* ) ),gcx;
-		# Path wildcard is lower priority than others, so separate from '*' wilds.
-		# Capture slashes on either side of the '**'.
-		if (m,\G( /? \*\* /? ),gcx) {
-			my $globstar= $1;
-			# When starts with wildcard but ends with literal, change strategy
-			# to match from end of string backward.  Also allow a single-star
-			# component, because that's less guesswork than a globstar.
-			if (substr($_, -3) !~ / \*\* \/? \Z/x) {
-				my $remain= reverse $globstar.substr($_, pos);
-				pos $remain = 0;
-				return $self->_add_pattern_to_trie($node->{reverse}//={}, $pat_idx) for $remain;
-			}
-			else {
-				my $sub_trie= {};
-				push @{ $node->{wild_path} }, [ $globstar, $sub_trie ];
-				$node= $sub_trie;
-			}
-		}
-		# Regular wildcards only continue until the next '/', or '**'
-		elsif(m,\G( \* (?: [^*/] | [*] (?! [*] ) )* ),gcx) {
-			$node= ($node->{wild}{$1}//={});
-		}
-		else { pos == length or die "bug" }
-	}
-	# At end of string, mark this as a terminal node
-	push @{ $node->{terminals} }, $pat_idx;
-}
+sub compile { shift->_compile }
 
 sub _compile {
-	my ($self)= @_;
-	$self->{_compiled_nodes}= [];
-	$self->_compile_node($self->{_trie}, '', matchers => 1);
-	return $self->{_compiled_nodes};
+	my $self= shift;
+	my @rules;
+	for my $p (@{ $self->patterns }) {
+		my $glob_text= $self->_pattern_from_object($p);
+		push @rules, map [ $glob_text, $_, $p ], $self->_glob_parser->($glob_text);
+	}
+	$self->_sort_rules(\@rules) if $self->match_best_first;
+	my @matchers= map {
+		my $regex_text= $self->_parsed_glob_to_regex($_->[1]);
+		$self->_compile_simple_matcher($regex_text, $_->[2], 0)
+	} @rules;
+	#use DDP; &p(\@matchers);
+	$self->{_matchers}= \@matchers;
 }
 
-sub _compile_node {
-	my ($self, $node, $path, %options)= @_;
-	my @trie_paths= grep length == 1, keys %$node;
-	my ($terminals, $wild, $reverse, $wild_path)= @{$node}{qw( terminals wild reverse wild_path )};
-	# Initialize the new compiled node and add it to the list.
-	# This list index is used to refer to nodes from the regex and from other nodes.
-	my $idx= @{ $self->{_compiled_nodes} };
-	my $cnode= {
-		idx => $idx,     # the index of this compiled node in the list
-		path => $path,   # the pattern matched so far, for debugging aid
-		($options{backtrack}? (backtrack => $options{backtrack}) : ()),
-		$options{is_reverse}? (is_reverse => 1) : (),
-	};
-	$cnode->{is_leaf}= 1
-		if $terminals && !@trie_paths && !$wild && !$reverse && !$wild_path;
-	$cnode->{is_backtrack_dest}= 1
-		if length($path) && ($wild || $reverse || $wild_path);
-	$cnode->{terminals}= [ @$terminals ]
-		if $terminals;
-	push @{ $self->{_compiled_nodes} }, $cnode;
-
-	push @{$cnode->{matchers}}, $self->_compile_trie_matcher($node, $path, cnode => $cnode)
-		if $options{matchers} && @trie_paths;
-
-	if ($wild) {
-		# Make a regex out of each of the wild portions, longest pattern first
-		for (sort { length $b <=> length $a } keys %$wild) {
-			# Replace '*' with regex notation for not matching the path separator
-			# But, a lone '*' must match at least one character
-			my $re_text= $_ eq '*'? '( [^\/]+ )'
-				: join '( [^\/]* )', map quotemeta, split /\*/, $_, -1;
-			# Follow this regex with the rest of a trie-construction from this node
-			push @{$cnode->{matchers}},
-				$self->_compile_trie_matcher($wild->{$_}, $path . $_, prefix => $re_text, origin => $cnode->{idx});
-		}
-	}
-	if ($reverse) {
-		$cnode->{reverse}= $self->_compile_node($reverse, '',
-			%options,
-			matchers => 1,
-			backtrack => undef,
-			is_reverse => !$cnode->{is_reverse},
-			origin => $cnode->{idx}
-		);
-	}
-	if ($wild_path) {
-		for (@$wild_path) {
-			my ($globstar, $nextnode)= @$_;
-			# globstar **/ at the start of the pattern may match an empty string
-			# globstar /** at the end of the pattern may match an empty string
-			# globstar /**/ may match a single slash, two slashes, or two slashes with arbitrary chars between
-			# In all cases, the capture should not include the leading or trailing slash
-			my $prefix= ($globstar eq '**/')? '(?| ^() | (.*?) \/ )'
-				: ($globstar eq '/**')? '(?| \/ (.*?) | ()\Z )'
-				: ($globstar eq '/**/')? '(?| ^() | \/()\/? | \/(.+?)\/ | ()\Z )'
-				: '(.*?)';
-			push @{$cnode->{unanchored}}, $self->_compile_trie_matcher($nextnode, $path.$globstar, prefix => $prefix, origin => $cnode->{idx});
-		}
-	}
-	return $cnode;
+sub search {
+	my ($self, $subject, $callback)= @_;
+	return $self->_search($callback, [], [], $self->{_matchers} // $self->compile)
+		for $subject;
 }
 
-our $_next_node;
-sub _compile_trie_matcher {
-	my ($self, $node, $path, %options)= @_;
-	my $re= $self->_compile_trie_regex_text($node, $path, %options);
-	$re= "\\G $re" unless $options{unanchored};
-	my $matcher= eval "qr/$re/x" or die "$@";
-	#return bless set_subname("_Matcher /$re/x", $matcher), 'Path::Match::_Matcher';
-}
-
-sub _compile_trie_regex_text {
-	my ($self, $node, $path_so_far, %options)= @_;
-	# On trie nodes that refer to a single character, descend to the next node
-	# and add the character to the start of the regex.
-	my $re= delete $options{prefix};
-	my $cnode= delete $options{cnode};
-	my @keys= keys %$node;
-	while (@keys == 1 && 1 == length $keys[0]) {
-		$re .= quotemeta $keys[0];
-		$path_so_far .= $keys[0];
-		$node= $node->{$keys[0]};
-		$cnode= undef;
-		@keys= keys %$node;
-	}
-	# Create a compild node for any trie node that ends a pattern, or has
-	# wildcards branching from it.
-	if (grep length > 1, @keys) {
-		$cnode ||= $self->_compile_node($node, $path_so_far, %options);
-		# Deeper nodes will need to backtrack to this one if it has any wildcards branching off of it
-		$options{backtrack}= $cnode->{idx}
-			if $cnode->{is_backtrack_dest};
-	}
-	$re .= " \\Z" if $cnode && $cnode->{is_leaf};
-	# Convert each trie sub-node into a regex fragment
-	my @alt= map $self->_compile_trie_regex_text($node->{$_}, $path_so_far.$_, %options, prefix => quotemeta($_)),
-		grep length == 1, @keys;
-	# If further processing needed here, add a stopping point
-	push @alt, '(?{ $_next_node='.$cnode->{idx}.' })' if $cnode && length $re;
-	# prevent backtracking
-	$re .= @alt > 1? ' (?> ' . join(' | ', @alt) . ' )' : ' '.$alt[0];
-	return $re;
-}
+use constant {
+	_SELF     => 0,
+	_CALLBACK => 1,
+	_CAPTURE  => 2,
+	_RCAPTURE => 3,
+	_MATCHERS => 4,
+};
 
 sub _search {
-	my ($self, $node, $callback, $reverse)= @_;
-	while (1) {
-		$DEBUG->("node $node->{path}: used '".substr($_, 0, pos)."', remaining '".substr($_, pos)."'") if $DEBUG;
-		if (length == pos) {
-			for (@{$node->{terminals}}) {
-				$DEBUG->("Matched pattern $_: $self->{patterns}[$_]") if $DEBUG;
-				my $ret= $_callback->($self->{patterns}[$_], [@_captures, @_reverse_cap]);
-				return $ret if $ret;
-			}
-		}
-		my $pos= pos;
-		if (defined $node->{matchers}) {
-			for my $m (@{$node->{matchers}}) {
-				$DEBUG->("node $node->{path} check matcher $m") if $DEBUG;
-				if (/$m/gc) {
-					local @_captures= ( @_captures, @{^CAPTURE} )
-						if !$_reverse && @{^CAPTURE};
-					local @_reverse_cap= ( (map scalar reverse($_), reverse @{^CAPTURE} ), @_reverse_cap )
-						if $_reverse && @{^CAPTURE};
-					my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
-					return $ret if $ret;
-					pos= $pos; # reset pos to backtrack and look for other wild matches
-				}
-			}
-		}
-		if (defined $node->{reverse}) {
-			$DEBUG->("node $node->{path}: trying reverse match") if $DEBUG;
-			local $_reverse= !$_reverse;
-			my $rev_subject= reverse substr($_, pos);
-			pos($rev_subject)= 0;
-			my $ret= $self->_search($node->{reverse}) for $rev_subject;
-			return $ret if $ret;
-		}
-		if (defined $node->{unanchored}) {
-			for my $m (@{$node->{unanchored}}) {
-				$DEBUG->("node $node->{path} check unanchored matcher $m") if $DEBUG;
-				if (/$m/gc) {
-					local @_captures= ( @_captures, @{^CAPTURE} )
-						if !$_reverse && @{^CAPTURE};
-					local @_reverse_cap= ( (map scalar reverse($_), reverse @{^CAPTURE} ), @_reverse_cap )
-						if $_reverse && @{^CAPTURE};
-					my $ret= $self->_search($self->{_compiled_nodes}[$_next_node]);
-					return $ret if $ret;
-					pos= $pos; # reset pos to backtrack and look for other wild matches
-				}
-			}
-		}
-		last unless $node->{backtrack};
-		$DEBUG->("Backtrack to $node->{backtrack}") if $DEBUG;
-		my $btnode= $self->{_compiled_nodes}[$node->{backtrack}];
-		# Backtracking only happens between non-wildcard alternatives, so can
-		# just compare the length of the nodes' patterns to know how far back
-		# on the input to seek.
-		pos($_) -= length($node->{path}) - length($btnode->{path});
-		$node= $btnode;
+	#my ($self, $callback, $capture, $rev_cap, $matchers)= @_;
+	my $start= pos;
+	my $max_cap= $#{$_[_CAPTURE]};
+	for my $matcher (@{$_[_MATCHERS]}) {
+		return 1 if &$matcher;
+		pos= $start;
+		$#{$_[_CAPTURE]}= $max_cap;
 	}
-	return !1;
+	return 0;
+}
+
+sub _rsearch {
+	my $start= pos;
+	my $max_rcap= $#{$_[_RCAPTURE]};
+	for my $matcher (@{$_[_MATCHERS]}) {
+		return 1 if &$matcher;
+		pos= $start;
+		$#{$_[_RCAPTURE]}= $max_rcap;
+	}
+	return 0;
+}
+
+sub _compile_simple_matcher {
+	my ($self, $regex, $pattern, $is_reverse)= @_;
+	my $cap= !$is_reverse? '[ @{ $_[_CAPTURE] }, @{^CAPTURE} ]'
+		: '[ @{ $_[_CAPTURE] }, reverse @{ $_[_RCAPTURE] }, @{^CAPTURE} ]';
+	my $matcher= eval "sub { /\\G $regex \\z/gcx && \$_[_CALLBACK]->(\$pattern, $cap) }" or die "$@";
+	set_subname("sub { /\\G $regex \\z/gcx && \$_[_CALLBACK]->(\$pattern, $cap) }", $matcher);
+	bless $matcher, 'Path::Match::_Matcher';
 }
 
 1;
